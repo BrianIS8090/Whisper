@@ -1,0 +1,8 @@
+openai-whisper
+keyboard
+pyaudio
+pyperclip
+groq
+python-dotenv
+PyQt6
+PyQt6-Fluent-Widgets
