@@ -179,6 +179,10 @@ class GlobalSpeechWorker(QObject):
                 else:
                     result = response.json()
                     text = result.get("result", "").strip()
+                    
+                    # --- YandexGPT Post-Processing ---
+                    if text and self.yandex_folder_id:
+                        text = self.yandex_gpt_correct(text)
 
             elif self.model:
                 result = self.model.transcribe(filename, language="ru", fp16=False, initial_prompt="Привет, это проба пера. Пишем текст на русском языке.")
@@ -189,6 +193,63 @@ class GlobalSpeechWorker(QObject):
         # Cleanup
         gc.collect()
         return text
+
+    def yandex_gpt_correct(self, text):
+        """
+        Sends text to YandexGPT for grammar/punctuation correction 
+        using the specific instruction provided by the user.
+        """
+        try:
+            url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+            
+            headers = {
+                "Authorization": f"Api-Key {self.yandex_key}",
+                "x-folder-id": self.yandex_folder_id,
+                "Content-Type": "application/json"
+            }
+            
+            prompt_instruction = (
+                "Входной текст, который тебе подается, нужно проверить на грамматику, пунктуацию, "
+                "на орфографию, выдать текст в правильном русском литературном формате. "
+                "Если это числовые или размерные параметры, то мы пишем числа 1, 2, 3 и т.п."
+            )
+            
+            data = {
+                "modelUri": f"gpt://{self.yandex_folder_id}/yandexgpt-lite/latest",
+                "completionOptions": {
+                    "stream": False,
+                    "temperature": 0.3, # Low temperature for more deterministic correction
+                    "maxTokens": 2000
+                },
+                "messages": [
+                    {
+                        "role": "system",
+                        "text": prompt_instruction
+                    },
+                    {
+                        "role": "user",
+                        "text": text
+                    }
+                ]
+            }
+            
+            response = requests.post(url, headers=headers, json=data)
+            
+            if response.status_code == 200:
+                result = response.json()
+                alternatives = result.get("result", {}).get("alternatives", [])
+                if alternatives:
+                    corrected_text = alternatives[0].get("message", {}).get("text", "")
+                    if corrected_text:
+                        print(f"YandexGPT Correction: '{text}' -> '{corrected_text}'")
+                        return corrected_text.strip()
+            else:
+                print(f"YandexGPT Error ({response.status_code}): {response.text}")
+                
+        except Exception as e:
+            print(f"YandexGPT Exception: {e}")
+            
+        return text # Return original text on failure
 
     def paste_text(self, text):
         try:
@@ -253,6 +314,41 @@ class TranscribeWorker(QObject):
                 response = requests.post(url, headers=headers, params=params, data=data)
                 if response.status_code == 200:
                     text = response.json().get("result", "")
+                    
+                    # --- YandexGPT Post-Processing ---
+                    if text and self.yandex_folder_id:
+                        try:
+                            # We reuse the logic. ideally this should be a shared function, 
+                            # but for now we inline it to match the GlobalSpeechWorker behavior.
+                            gpt_url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+                            gpt_headers = {
+                                "Authorization": f"Api-Key {self.yandex_key}",
+                                "x-folder-id": self.yandex_folder_id,
+                                "Content-Type": "application/json"
+                            }
+                            prompt_instruction = (
+                                "Входной текст, который тебе подается, нужно проверить на грамматику, пунктуацию, "
+                                "на орфографию, выдать текст в правильном русском литературном формате. "
+                                "Если это числовые или размерные параметры, то мы пишем числа 1, 2, 3 и т.п."
+                            )
+                            gpt_data = {
+                                "modelUri": f"gpt://{self.yandex_folder_id}/yandexgpt-lite/latest",
+                                "completionOptions": {"stream": False, "temperature": 0.3, "maxTokens": 2000},
+                                "messages": [
+                                    {"role": "system", "text": prompt_instruction},
+                                    {"role": "user", "text": text}
+                                ]
+                            }
+                            gpt_response = requests.post(gpt_url, headers=gpt_headers, json=gpt_data)
+                            if gpt_response.status_code == 200:
+                                alts = gpt_response.json().get("result", {}).get("alternatives", [])
+                                if alts:
+                                    corrected = alts[0].get("message", {}).get("text", "")
+                                    if corrected:
+                                        text = corrected.strip()
+                        except Exception as val_err:
+                            print(f"YandexGPT File Correction Error: {val_err}")
+
                 else:
                     self.error.emit(f"Yandex Error: {response.text}")
                     return
