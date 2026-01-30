@@ -4,8 +4,17 @@ from qfluentwidgets import (SwitchButton, SubtitleLabel, BodyLabel,
                             TextEdit, InfoBar, InfoBarPosition, CardWidget, IconWidget, ComboBox)
 from qfluentwidgets import FluentIcon as FIF
 import os
+import sys
 from workers import GlobalSpeechWorker
 from dotenv import load_dotenv
+
+def get_env_path():
+    """Возвращает путь к .env файлу (AppData для exe, корень проекта для скрипта)"""
+    if getattr(sys, 'frozen', False):
+        appdata_dir = os.path.join(os.environ.get('APPDATA', ''), 'WisperAI')
+        return os.path.join(appdata_dir, ".env")
+    else:
+        return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
 
 class HomeInterface(QWidget):
     def __init__(self, parent=None):
@@ -13,8 +22,7 @@ class HomeInterface(QWidget):
         self.setObjectName("HomeInterface")
         
         # Explicitly reload .env to ensure fresh settings
-        root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        env_path = os.path.join(root_dir, ".env")
+        env_path = get_env_path()
         load_dotenv(env_path, override=True)
         
         # Debug prints

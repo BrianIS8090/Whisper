@@ -6,11 +6,27 @@ import wave
 import keyboard
 import pyaudio
 import pyperclip
-import whisper
 import gc
 import requests
+import subprocess
+import sys
 from groq import Groq
 from PyQt6.QtCore import QObject, pyqtSignal, QThread
+
+# Патч для скрытия консольного окна ffmpeg на Windows
+if sys.platform == "win32":
+    _original_popen = subprocess.Popen
+    
+    def _popen_no_console(*args, **kwargs):
+        # Добавляем флаг CREATE_NO_WINDOW если не указан creationflags
+        if 'creationflags' not in kwargs:
+            kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+        return _original_popen(*args, **kwargs)
+    
+    subprocess.Popen = _popen_no_console
+
+# Импортируем whisper ПОСЛЕ патча subprocess
+import whisper
 
 class GlobalSpeechWorker(QObject):
     status_changed = pyqtSignal(str)  # "idle", "recording", "transcribing"

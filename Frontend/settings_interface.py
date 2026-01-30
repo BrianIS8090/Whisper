@@ -4,13 +4,25 @@ from qfluentwidgets import (SubtitleLabel, BodyLabel, LineEdit, ComboBox,
                             PrimaryPushButton, CardWidget, InfoBar, InfoBarPosition)
 from qfluentwidgets import FluentIcon as FIF
 import os
+import sys
 from dotenv import set_key
+
+def get_env_path():
+    """Возвращает путь к .env файлу (AppData для exe, корень проекта для скрипта)"""
+    if getattr(sys, 'frozen', False):
+        # Скомпилированный exe — используем AppData
+        appdata_dir = os.path.join(os.environ.get('APPDATA', ''), 'WisperAI')
+        os.makedirs(appdata_dir, exist_ok=True)
+        return os.path.join(appdata_dir, ".env")
+    else:
+        # Запуск как скрипт
+        return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
 
 class SettingsInterface(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent=parent)
         self.setObjectName("SettingsInterface")
-        self.env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+        self.env_path = get_env_path()
         
         self.initUI()
         self.load_settings()
