@@ -7,9 +7,12 @@ import keyboard
 import pyaudio
 import pyperclip
 import gc
+import hashlib
 import requests
 import subprocess
 import sys
+import urllib.request
+import warnings
 from groq import Groq
 from PyQt6.QtCore import QObject, pyqtSignal, QThread
 
@@ -29,9 +32,10 @@ if sys.platform == "win32":
 import whisper
 
 class GlobalSpeechWorker(QObject):
-    status_changed = pyqtSignal(str)  # "idle", "recording", "transcribing"
+    status_changed = pyqtSignal(str)  # "initializing", "ready", "idle", "recording", "transcribing", "model_downloading:<pct>"
     text_ready = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
+    event_message = pyqtSignal(str)
     
     def __init__(self, api_key=None, model_name="small", hotkey="F8", 
                  use_groq=False, use_yandex=False, yandex_key=None, yandex_folder_id=None):
@@ -47,28 +51,45 @@ class GlobalSpeechWorker(QObject):
         self.groq_client = None
         self.model = None
         self.p = None
+        self.initialized = False
+        self._last_download_percent = -1
+        self._last_logged_bucket = -1
         
     def initialize(self):
         """Loads the model or API client. Runs in the background thread."""
+        self.initialized = False
         try:
+            self.status_changed.emit("initializing")
             self.p = pyaudio.PyAudio()
+            self.event_message.emit("Инициализация аудио-подсистемы...")
             
             if self.use_groq and self.api_key:
+                self.event_message.emit("Инициализация Groq API...")
                 self.groq_client = Groq(api_key=self.api_key)
                 print("Groq Client Initialized")
             elif self.use_yandex and self.yandex_key:
+                self.event_message.emit("Инициализация Yandex SpeechKit...")
                 print(f"Yandex SpeechKit Initialized (Folder: {self.yandex_folder_id})")
             else:
-                print(f"Loading Whisper model: {self.model_name}")
-                self.model = whisper.load_model(self.model_name)
+                self.event_message.emit(f"Инициализация локальной модели Whisper '{self.model_name}'...")
+                self.model = self.load_local_model_with_status(self.model_name)
                 print("Whisper Model Loaded")
-                
+
+            self.initialized = True
+            self.status_changed.emit("ready")
+            self.event_message.emit("Служба инициализирована и готова к диктовке (F8).")
         except Exception as e:
+            self.running = False
             self.error_occurred.emit(f"Initialization Error: {e}")
 
     def run(self):
         self.running = True
         self.initialize()
+
+        if not self.initialized:
+            if self.p:
+                self.p.terminate()
+            return
         
         # Hotkey listener loop
         print(f"Worker started. Waiting for {self.hotkey}...")
@@ -85,6 +106,107 @@ class GlobalSpeechWorker(QObject):
 
         if self.p:
             self.p.terminate()
+
+    def get_whisper_cache_dir(self):
+        default_cache = os.path.join(os.path.expanduser("~"), ".cache")
+        return os.path.join(os.getenv("XDG_CACHE_HOME", default_cache), "whisper")
+
+    def emit_download_progress(self, downloaded_size, total_size):
+        if not total_size:
+            return
+
+        percent = int((downloaded_size * 100) / total_size)
+        percent = max(0, min(100, percent))
+
+        if percent != self._last_download_percent:
+            self._last_download_percent = percent
+            self.status_changed.emit(f"model_downloading:{percent}")
+
+        bucket = percent // 10
+        if bucket != self._last_logged_bucket:
+            self._last_logged_bucket = bucket
+            self.event_message.emit(f"Скачивание модели Whisper: {percent}%")
+
+    def load_local_model_with_status(self, model_name):
+        if model_name not in whisper._MODELS:
+            self.event_message.emit(f"Загрузка модели из файла: {model_name}")
+            return whisper.load_model(model_name)
+
+        download_root = self.get_whisper_cache_dir()
+        model_url = whisper._MODELS[model_name]
+        download_target = os.path.join(download_root, os.path.basename(model_url))
+
+        original_download = whisper._download
+
+        def download_with_progress(url, root, in_memory):
+            os.makedirs(root, exist_ok=True)
+            target = os.path.join(root, os.path.basename(url))
+            expected_hash = url.split("/")[-2]
+
+            if os.path.exists(target) and not os.path.isfile(target):
+                raise RuntimeError(f"{target} exists and is not a regular file")
+
+            if os.path.isfile(target):
+                self.event_message.emit(f"Найден файл модели в кэше: {os.path.basename(target)}")
+                self.status_changed.emit("model_validating")
+                with open(target, "rb") as f:
+                    model_bytes = f.read()
+                file_hash = hashlib.sha256(model_bytes).hexdigest()
+                if file_hash == expected_hash:
+                    self.event_message.emit("Файл модели валиден, скачивание не требуется.")
+                    self.status_changed.emit("model_loading")
+                    return model_bytes if in_memory else target
+
+                warnings.warn(
+                    f"{target} exists, but the SHA256 checksum does not match; re-downloading the file"
+                )
+                self.event_message.emit("Найдена повреждённая модель (не совпадает SHA256), выполняется повторное скачивание.")
+
+            self.status_changed.emit("model_downloading:0")
+            self._last_download_percent = -1
+            self._last_logged_bucket = -1
+            self.event_message.emit(f"Скачивание модели Whisper '{model_name}'...")
+
+            downloaded_size = 0
+            with urllib.request.urlopen(url) as source, open(target, "wb") as output:
+                total_size = int(source.info().get("Content-Length", "0"))
+                while True:
+                    buffer = source.read(8192)
+                    if not buffer:
+                        break
+                    output.write(buffer)
+                    downloaded_size += len(buffer)
+                    self.emit_download_progress(downloaded_size, total_size)
+
+            model_bytes = open(target, "rb").read()
+            file_hash = hashlib.sha256(model_bytes).hexdigest()
+            if file_hash != expected_hash:
+                raise RuntimeError(
+                    "Model has been downloaded but the SHA256 checksum does not match. Please retry loading the model."
+                )
+
+            self.status_changed.emit("model_downloading:100")
+            self.event_message.emit("Скачивание модели завершено.")
+            self.status_changed.emit("model_loading")
+            return model_bytes if in_memory else target
+
+        try:
+            whisper._download = download_with_progress
+            if os.path.isfile(download_target):
+                self.event_message.emit(
+                    f"Подготовка локальной модели '{model_name}' (проверка целостности и загрузка в память)..."
+                )
+            else:
+                self.event_message.emit(
+                    f"Локальная модель '{model_name}' не найдена в кэше, начнется скачивание."
+                )
+
+            model = whisper.load_model(model_name, download_root=download_root)
+            if os.path.isfile(download_target):
+                self.event_message.emit(f"Локальная модель '{model_name}' успешно загружена.")
+            return model
+        finally:
+            whisper._download = original_download
 
     def perform_recording_cycle(self):
         self.status_changed.emit("recording")

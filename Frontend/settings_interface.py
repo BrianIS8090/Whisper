@@ -1,11 +1,21 @@
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout
 from qfluentwidgets import (SubtitleLabel, BodyLabel, LineEdit, ComboBox, 
-                            PrimaryPushButton, CardWidget, InfoBar, InfoBarPosition)
+                            PrimaryPushButton, PushButton, CardWidget, InfoBar, InfoBarPosition)
 from qfluentwidgets import FluentIcon as FIF
 import os
 import sys
+import whisper
 from dotenv import set_key
+
+MODEL_ALIASES = {
+    "tiny": ["tiny", "tiny.en"],
+    "base": ["base", "base.en"],
+    "small": ["small", "small.en"],
+    "medium": ["medium", "medium.en"],
+    "large": ["large", "large-v1", "large-v2", "large-v3"],
+    "turbo": ["turbo", "large-v3-turbo"]
+}
 
 def get_env_path():
     """Возвращает путь к .env файлу (AppData для exe, корень проекта для скрипта)"""
@@ -77,20 +87,20 @@ class SettingsInterface(QWidget):
         
         self.modelLabel = BodyLabel("Локальная модель Whisper", self.modelCard)
         self.modelComboBox = ComboBox(self.modelCard)
-        
-        # Populate models with download status
-        downloaded = self.get_downloaded_models()
-        models = ["tiny", "base", "small", "medium", "large", "turbo"]
-        
-        for m in models:
-            text = m
-            if m in downloaded:
-                text += " (Скачано)"
-            # Important: use userData parameter for clean value
-            self.modelComboBox.addItem(text, userData=m)
+        self.populate_model_combo()
+
+        self.modelActionsLayout = QHBoxLayout()
+        self.refreshModelsBtn = PushButton(FIF.SYNC, "Обновить статусы", self.modelCard)
+        self.refreshModelsBtn.clicked.connect(self.refresh_model_statuses)
+        self.deleteModelBtn = PushButton(FIF.DELETE, "Удалить выбранную модель", self.modelCard)
+        self.deleteModelBtn.clicked.connect(self.delete_selected_model)
+        self.modelActionsLayout.addWidget(self.refreshModelsBtn)
+        self.modelActionsLayout.addWidget(self.deleteModelBtn)
+        self.modelActionsLayout.addStretch(1)
         
         self.modelLayout.addWidget(self.modelLabel)
         self.modelLayout.addWidget(self.modelComboBox)
+        self.modelLayout.addLayout(self.modelActionsLayout)
         
         self.vBoxLayout.addWidget(self.modelCard)
 
@@ -117,23 +127,126 @@ class SettingsInterface(QWidget):
         self.vBoxLayout.addStretch(1)
 
     def get_downloaded_models(self):
-        """Checks standard Whisper cache for existing models."""
+        """Определяет, какие модели реально присутствуют в кэше Whisper."""
         downloaded = []
-        try:
-            home = os.path.expanduser("~")
-            cache_dir = os.path.join(home, ".cache", "whisper")
-            
-            if os.path.exists(cache_dir):
-                files = os.listdir(cache_dir)
-                for f in files:
-                    if f.endswith(".pt"):
-                        for m in ["tiny", "base", "small", "medium", "large", "turbo"]:
-                            # Matches filenames like 'small.pt' or hashes starting with 'small'
-                            if f.startswith(m):
-                                downloaded.append(m)
-        except Exception:
-            pass
-        return list(set(downloaded))
+        for model_name in ["tiny", "base", "small", "medium", "large", "turbo"]:
+            if self.is_model_downloaded(model_name):
+                downloaded.append(model_name)
+        return downloaded
+
+    def get_whisper_cache_dir(self):
+        default_cache = os.path.join(os.path.expanduser("~"), ".cache")
+        return os.path.join(os.getenv("XDG_CACHE_HOME", default_cache), "whisper")
+
+    def get_model_cache_files(self, model_name):
+        """Возвращает список возможных файлов кэша для UI-модели."""
+        aliases = MODEL_ALIASES.get(model_name, [model_name])
+        files = set()
+        for alias in aliases:
+            model_url = whisper._MODELS.get(alias)
+            if model_url:
+                files.add(os.path.basename(model_url))
+            files.add(f"{alias}.pt")
+        return sorted(files)
+
+    def is_model_downloaded(self, model_name):
+        cache_dir = self.get_whisper_cache_dir()
+        if not os.path.isdir(cache_dir):
+            return False
+        for filename in self.get_model_cache_files(model_name):
+            path = os.path.join(cache_dir, filename)
+            if os.path.isfile(path) and os.path.getsize(path) > 0:
+                return True
+        return False
+
+    def populate_model_combo(self):
+        current_model = None
+        if hasattr(self, "modelComboBox") and self.modelComboBox.count() > 0:
+            current_model = self.modelComboBox.itemData(self.modelComboBox.currentIndex())
+
+        self.modelComboBox.clear()
+        downloaded = set(self.get_downloaded_models())
+        for model_name in ["tiny", "base", "small", "medium", "large", "turbo"]:
+            item_text = model_name
+            if model_name in downloaded:
+                item_text += " (Скачано)"
+            self.modelComboBox.addItem(item_text, userData=model_name)
+
+        if current_model:
+            for i in range(self.modelComboBox.count()):
+                if self.modelComboBox.itemData(i) == current_model:
+                    self.modelComboBox.setCurrentIndex(i)
+                    break
+
+    def refresh_model_statuses(self):
+        self.populate_model_combo()
+        InfoBar.success(
+            title='Обновлено',
+            content="Статусы локальных моделей обновлены.",
+            orient=Qt.Orientation.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP_RIGHT,
+            duration=2500,
+            parent=self
+        )
+
+    def delete_selected_model(self):
+        model_name = self.modelComboBox.itemData(self.modelComboBox.currentIndex())
+        if not model_name:
+            model_name = "small"
+
+        cache_dir = self.get_whisper_cache_dir()
+        os.makedirs(cache_dir, exist_ok=True)
+
+        files_to_remove = []
+        for filename in self.get_model_cache_files(model_name):
+            candidate = os.path.join(cache_dir, filename)
+            if os.path.isfile(candidate):
+                files_to_remove.append(candidate)
+
+        if not files_to_remove:
+            InfoBar.warning(
+                title='Нет файлов',
+                content=f"Для модели '{model_name}' в кэше ничего не найдено.",
+                orient=Qt.Orientation.Horizontal,
+                isClosable=True,
+                position=InfoBarPosition.TOP_RIGHT,
+                duration=3000,
+                parent=self
+            )
+            return
+
+        errors = []
+        removed = 0
+        for path in files_to_remove:
+            try:
+                os.remove(path)
+                removed += 1
+            except Exception as e:
+                errors.append(f"{os.path.basename(path)}: {e}")
+
+        self.populate_model_combo()
+        if errors:
+            InfoBar.error(
+                title='Удалено частично',
+                content="; ".join(errors),
+                orient=Qt.Orientation.Horizontal,
+                isClosable=True,
+                position=InfoBarPosition.TOP_RIGHT,
+                duration=4500,
+                parent=self
+            )
+            return
+
+        InfoBar.success(
+            title='Модель удалена',
+            content=f"Удалено файлов: {removed}. При следующем запуске модель скачивается заново.",
+            orient=Qt.Orientation.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP_RIGHT,
+            duration=3500,
+            parent=self
+        )
 
     def load_settings(self):
         api_key = os.getenv("GROQ_API_KEY", "")

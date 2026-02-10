@@ -1,7 +1,7 @@
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel
+from PyQt6.QtCore import Qt, QThread
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout
 from qfluentwidgets import (SwitchButton, SubtitleLabel, BodyLabel, 
-                            TextEdit, InfoBar, InfoBarPosition, CardWidget, IconWidget, ComboBox)
+                            TextEdit, CardWidget, IconWidget, ComboBox)
 from qfluentwidgets import FluentIcon as FIF
 import os
 import sys
@@ -34,6 +34,7 @@ class HomeInterface(QWidget):
         
         self.worker = None
         self.thread = None
+        self.mode_text = "Whisper"
         
         self.initUI()
         self.initWorker()
@@ -134,8 +135,10 @@ class HomeInterface(QWidget):
         # Connect signals
         self.thread.started.connect(self.worker.run)
         self.worker.status_changed.connect(self.update_status)
+        self.worker.event_message.connect(self.log_message)
         self.worker.text_ready.connect(self.log_success)
         self.worker.error_occurred.connect(self.log_error)
+        self.thread.finished.connect(self.on_worker_finished)
         
     def toggle_service(self, checked):
         if checked:
@@ -159,25 +162,56 @@ class HomeInterface(QWidget):
                 mode_text = "Yandex SpeechKit"
             else:
                 mode_text = f"Whisper {self.worker.model_name}"
+            self.mode_text = mode_text
             
             self.statusLabel.setText(f"Запуск службы ({mode_text})...")
             self.log_message(f"Запуск службы [{mode_text}]...")
             
             self.switchButton.setEnabled(False)
             self.thread.start()
-            self.switchButton.setEnabled(True)
-            self.statusLabel.setText("Служба активна (Нажмите F8)")
         else:
             self.statusLabel.setText("Остановка...")
             self.worker.stop()
-            self.thread.quit()
-            self.thread.wait()
+            if self.thread.isRunning():
+                self.thread.quit()
+                self.thread.wait()
             
             self.modeComboBox.setEnabled(True) # Unlock selection
             self.statusLabel.setText("Служба остановлена")
             self.log_message("Служба остановлена.")
+            self.switchButton.setEnabled(True)
 
     def update_status(self, status):
+        if status == "initializing":
+            self.statusLabel.setText(f"Инициализация ({self.mode_text})...")
+            self.iconWidget.setIcon(FIF.SYNC)
+            return
+
+        if status == "ready":
+            self.statusLabel.setText("Служба активна (Нажмите F8)")
+            self.iconWidget.setIcon(FIF.MICROPHONE)
+            self.switchButton.setEnabled(True)
+            return
+
+        if status == "model_validating":
+            self.statusLabel.setText("Проверка локальной модели...")
+            self.iconWidget.setIcon(FIF.FOLDER)
+            return
+
+        if status == "model_loading":
+            self.statusLabel.setText("Загрузка локальной модели в память...")
+            self.iconWidget.setIcon(FIF.SYNC)
+            return
+
+        if status.startswith("model_downloading:"):
+            try:
+                percent = int(status.split(":", 1)[1])
+            except ValueError:
+                percent = 0
+            self.statusLabel.setText(f"Скачивание локальной модели... {percent}%")
+            self.iconWidget.setIcon(FIF.DOWNLOAD)
+            return
+
         if status == "recording":
             self.statusLabel.setText("Запись...")
             self.iconWidget.setIcon(FIF.MICROPHONE)
@@ -196,3 +230,17 @@ class HomeInterface(QWidget):
 
     def log_error(self, err):
         self.logText.append(f"❌ Ошибка: {err}")
+        if str(err).startswith("Initialization Error"):
+            self.statusLabel.setText("Ошибка запуска службы")
+            self.iconWidget.setIcon(FIF.CLOSE)
+            self.switchButton.setEnabled(True)
+            self.modeComboBox.setEnabled(True)
+            if self.switchButton.isChecked():
+                self.switchButton.blockSignals(True)
+                self.switchButton.setChecked(False)
+                self.switchButton.blockSignals(False)
+
+    def on_worker_finished(self):
+        if not self.switchButton.isChecked():
+            self.modeComboBox.setEnabled(True)
+        self.switchButton.setEnabled(True)
