@@ -1,12 +1,26 @@
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QUrl
+from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout
 from qfluentwidgets import (SubtitleLabel, BodyLabel, LineEdit, ComboBox, 
-                            PrimaryPushButton, PushButton, CardWidget, InfoBar, InfoBarPosition)
+                            PrimaryPushButton, PushButton, CardWidget, InfoBar, InfoBarPosition,
+                            HyperlinkLabel)
 from qfluentwidgets import FluentIcon as FIF
 import os
 import sys
 import whisper
 from dotenv import set_key
+from version import __version__, __app_name__, __author__, __email__
+
+HOTKEY_OPTIONS = [
+    ("F8", "F8"),
+    ("F7", "F7"),
+    ("F9", "F9"),
+    ("F6", "F6"),
+    ("F10", "F10"),
+    ("ctrl+space", "Ctrl+Space"),
+    ("ctrl+shift+d", "Ctrl+Shift+D"),
+    ("alt+d", "Alt+D"),
+]
 
 MODEL_ALIASES = {
     "tiny": ["tiny", "tiny.en"],
@@ -118,6 +132,45 @@ class SettingsInterface(QWidget):
         self.modeLayout.addWidget(self.modeComboBox)
         
         self.vBoxLayout.addWidget(self.modeCard)
+
+        # Hotkey Card
+        self.hotkeyCard = CardWidget(self)
+        self.hotkeyLayout = QVBoxLayout(self.hotkeyCard)
+        
+        self.hotkeyLabel = BodyLabel("Горячая клавиша для диктовки", self.hotkeyCard)
+        self.hotkeyComboBox = ComboBox(self.hotkeyCard)
+        for key_value, key_display in HOTKEY_OPTIONS:
+            self.hotkeyComboBox.addItem(key_display, userData=key_value)
+        
+        self.hotkeyLayout.addWidget(self.hotkeyLabel)
+        self.hotkeyLayout.addWidget(self.hotkeyComboBox)
+        
+        self.vBoxLayout.addWidget(self.hotkeyCard)
+
+        # About Card
+        self.aboutCard = CardWidget(self)
+        self.aboutLayout = QVBoxLayout(self.aboutCard)
+        
+        self.aboutLabel = SubtitleLabel("О программе", self.aboutCard)
+        self.versionLabel = BodyLabel(f"{__app_name__} v{__version__}", self.aboutCard)
+        self.aboutDescLabel = BodyLabel("Приложение для распознавания речи", self.aboutCard)
+        
+        self.contactLayout = QHBoxLayout()
+        self.contactLabel = BodyLabel("Связь: ", self.aboutCard)
+        self.emailLink = HyperlinkLabel()
+        self.emailLink.setUrl(QUrl(f"mailto:{__email__}"))
+        self.emailLink.setText(__email__)
+        self.emailLink.setParent(self.aboutCard)
+        self.contactLayout.addWidget(self.contactLabel)
+        self.contactLayout.addWidget(self.emailLink)
+        self.contactLayout.addStretch(1)
+        
+        self.aboutLayout.addWidget(self.aboutLabel)
+        self.aboutLayout.addWidget(self.versionLabel)
+        self.aboutLayout.addWidget(self.aboutDescLabel)
+        self.aboutLayout.addLayout(self.contactLayout)
+        
+        self.vBoxLayout.addWidget(self.aboutCard)
         
         # Save Button
         self.saveBtn = PrimaryPushButton(FIF.SAVE, "Сохранить", self)
@@ -277,6 +330,16 @@ class SettingsInterface(QWidget):
                 break
         if idx != -1:
             self.modeComboBox.setCurrentIndex(idx)
+        
+        # Load Hotkey
+        hotkey = os.getenv("HOTKEY", "F8")
+        idx = -1
+        for i in range(self.hotkeyComboBox.count()):
+            if self.hotkeyComboBox.itemData(i) == hotkey:
+                idx = i
+                break
+        if idx != -1:
+            self.hotkeyComboBox.setCurrentIndex(idx)
 
     def save_settings(self):
         try:
@@ -284,12 +347,13 @@ class SettingsInterface(QWidget):
             new_yandex_key = self.yandexKeyInput.text().strip()
             new_folder_id = self.yandexFolderInput.text().strip()
             
-            # Get data from itemData instead of text
             new_model = self.modelComboBox.itemData(self.modelComboBox.currentIndex())
             new_mode = self.modeComboBox.itemData(self.modeComboBox.currentIndex())
+            new_hotkey = self.hotkeyComboBox.itemData(self.hotkeyComboBox.currentIndex())
             
             if not new_model: new_model = "small"
             if not new_mode: new_mode = "local"
+            if not new_hotkey: new_hotkey = "F8"
 
             # Create .env if it doesn't exist
             if not os.path.exists(self.env_path):
@@ -301,6 +365,7 @@ class SettingsInterface(QWidget):
             set_key(self.env_path, "YANDEX_FOLDER_ID", new_folder_id)
             set_key(self.env_path, "MODEL_SIZE", str(new_model))
             set_key(self.env_path, "DEFAULT_MODE", str(new_mode))
+            set_key(self.env_path, "HOTKEY", str(new_hotkey))
             
             # Update session
             os.environ["GROQ_API_KEY"] = new_key
@@ -308,10 +373,11 @@ class SettingsInterface(QWidget):
             os.environ["YANDEX_FOLDER_ID"] = new_folder_id
             os.environ["MODEL_SIZE"] = str(new_model)
             os.environ["DEFAULT_MODE"] = str(new_mode)
+            os.environ["HOTKEY"] = str(new_hotkey)
             
             InfoBar.success(
                 title='Сохранено',
-                content=f"Модель: {new_model}, Режим: {new_mode}",
+                content=f"Модель: {new_model}, Режим: {new_mode}, Клавиша: {new_hotkey}",
                 orient=Qt.Orientation.Horizontal,
                 isClosable=True,
                 position=InfoBarPosition.TOP_RIGHT,

@@ -41,6 +41,7 @@ from qfluentwidgets import (NavigationItemPosition, FluentWindow, FluentIcon as 
 from home_interface import HomeInterface
 from transcribe_interface import TranscribeInterface
 from settings_interface import SettingsInterface
+from version import __version__, __app_name__
 
 
 class SplashScreen(QWidget):
@@ -99,7 +100,7 @@ class Window(FluentWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Wisper AI')
+        self.setWindowTitle(f'{__app_name__} v{__version__}')
         
         # Handle icon for both script and frozen exe
         if getattr(sys, 'frozen', False):

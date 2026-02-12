@@ -35,6 +35,7 @@ class HomeInterface(QWidget):
         self.worker = None
         self.thread = None
         self.mode_text = "Whisper"
+        self.current_hotkey = "F8"
         
         self.initUI()
         self.initWorker()
@@ -114,6 +115,10 @@ class HomeInterface(QWidget):
         api_key = os.getenv("GROQ_API_KEY")
         yandex_key = os.getenv("YANDEX_API_KEY")
         folder_id = os.getenv("YANDEX_FOLDER_ID")
+        hotkey = os.getenv("HOTKEY", "F8")
+        
+        # Сохраняем для отображения в статусе
+        self.current_hotkey = hotkey
         
         # Determine initial state
         # Logic: Check combobox index which is already set in initUI
@@ -127,7 +132,8 @@ class HomeInterface(QWidget):
             yandex_folder_id=folder_id,
             use_groq=use_groq, 
             use_yandex=use_yandex,
-            model_name=model_size
+            model_name=model_size,
+            hotkey=hotkey
         )
         self.thread = QThread()
         self.worker.moveToThread(self.thread)
@@ -147,12 +153,16 @@ class HomeInterface(QWidget):
             is_groq = (idx == 0)
             is_yandex = (idx == 1)
             
+            # Обновляем горячую клавишу из настроек
+            self.current_hotkey = os.getenv("HOTKEY", "F8")
+            
             self.worker.use_groq = is_groq
             self.worker.use_yandex = is_yandex
             self.worker.api_key = os.getenv("GROQ_API_KEY")
             self.worker.yandex_key = os.getenv("YANDEX_API_KEY")
             self.worker.yandex_folder_id = os.getenv("YANDEX_FOLDER_ID")
             self.worker.model_name = os.getenv("MODEL_SIZE", "small")
+            self.worker.hotkey = self.current_hotkey
             
             self.modeComboBox.setEnabled(False)
             
@@ -188,7 +198,7 @@ class HomeInterface(QWidget):
             return
 
         if status == "ready":
-            self.statusLabel.setText("Служба активна (Нажмите F8)")
+            self.statusLabel.setText(f"Служба активна (Нажмите {self.current_hotkey})")
             self.iconWidget.setIcon(FIF.MICROPHONE)
             self.switchButton.setEnabled(True)
             return
@@ -219,7 +229,7 @@ class HomeInterface(QWidget):
             self.statusLabel.setText("Распознавание...")
             self.iconWidget.setIcon(FIF.FOLDER)
         else:
-            self.statusLabel.setText("Ожидание (F8)")
+            self.statusLabel.setText(f"Ожидание ({self.current_hotkey})")
             self.iconWidget.setIcon(FIF.MICROPHONE)
 
     def log_message(self, msg):
