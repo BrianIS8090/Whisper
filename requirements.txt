@@ -6,3 +6,4 @@ groq
 python-dotenv
 PyQt6
 PyQt6-Fluent-Widgets
+pymorphy3

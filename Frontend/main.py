@@ -39,7 +39,8 @@ except ImportError:
 
 from qfluentwidgets import (NavigationItemPosition, FluentWindow, FluentIcon as FIF)
 from home_interface import HomeInterface
-from transcribe_interface import TranscribeInterface
+from chunked_transcribe_interface import ChunkedTranscribeInterface
+from dictionary_interface import DictionaryInterface
 from settings_interface import SettingsInterface
 from version import __version__, __app_name__
 
@@ -113,7 +114,8 @@ class Window(FluentWindow):
 
         # create sub interfaces
         self.homeInterface = HomeInterface(self)
-        self.transcribeInterface = TranscribeInterface(self)
+        self.chunkedTranscribeInterface = ChunkedTranscribeInterface(self)
+        self.dictionaryInterface = DictionaryInterface(self)
         self.settingInterface = SettingsInterface(self)
 
         # initialize layout
@@ -122,7 +124,8 @@ class Window(FluentWindow):
 
     def initNavigation(self):
         self.addSubInterface(self.homeInterface, FIF.MICROPHONE, 'Диктовка')
-        self.addSubInterface(self.transcribeInterface, FIF.FOLDER, 'Транскрипция')
+        self.addSubInterface(self.chunkedTranscribeInterface, FIF.DOWNLOAD, 'Транскрипция 25MB')
+        self.addSubInterface(self.dictionaryInterface, FIF.EDIT, 'Словарь')
 
         self.addSubInterface(self.settingInterface, FIF.SETTING, 'Настройки', NavigationItemPosition.BOTTOM)
 

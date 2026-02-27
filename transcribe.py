@@ -6,7 +6,24 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-def transcribe_audio(file_path, model_name="base", use_api=False):
+
+def save_markdown(file_path, text, prompt=""):
+    """Сохраняет результат в Markdown файл рядом с исходным аудио."""
+    output_file = os.path.splitext(file_path)[0] + ".md"
+    file_title = os.path.basename(file_path)
+
+    lines = [f"# Расшифровка: {file_title}", ""]
+    if prompt:
+        lines.extend(["## Промт", prompt, ""])
+    lines.extend(["## Текст", text, ""])
+
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    print(f"\nTranscription saved to '{output_file}'")
+
+
+def transcribe_audio(file_path, model_name="base", use_api=False, prompt=""):
     if not os.path.exists(file_path):
         print(f"Error: File '{file_path}' not found.")
         return
@@ -22,12 +39,17 @@ def transcribe_audio(file_path, model_name="base", use_api=False):
         try:
             client = Groq(api_key=api_key)
             with open(file_path, "rb") as file:
+                request_data = {
+                    "file": (file_path, file.read()),
+                    "model": "whisper-large-v3",
+                    "temperature": 0,
+                    "language": "ru",
+                    "response_format": "verbose_json",
+                }
+                if prompt:
+                    request_data["prompt"] = prompt
                 transcription = client.audio.transcriptions.create(
-                    file=(file_path, file.read()),
-                    model="whisper-large-v3",
-                    temperature=0,
-                    language="ru",
-                    response_format="verbose_json",
+                    **request_data
                 )
                 text = transcription.text
         except Exception as e:
@@ -38,7 +60,10 @@ def transcribe_audio(file_path, model_name="base", use_api=False):
         model = whisper.load_model(model_name)
         
         print(f"Transcribing '{file_path}' locally...")
-        result = model.transcribe(file_path, fp16=False, language="ru")
+        transcribe_args = {"fp16": False, "language": "ru"}
+        if prompt:
+            transcribe_args["initial_prompt"] = prompt
+        result = model.transcribe(file_path, **transcribe_args)
         text = result["text"]
     
     if not text:
@@ -48,22 +73,19 @@ def transcribe_audio(file_path, model_name="base", use_api=False):
     print("\nTranscription result:\n")
     print(text)
     
-    # Save to a text file
-    output_file = os.path.splitext(file_path)[0] + ".txt"
-    with open(output_file, "w", encoding="utf-8") as f:
-        f.write(text)
-    print(f"\nTranscription saved to '{output_file}'")
+    save_markdown(file_path, text, prompt=prompt)
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python transcribe.py <audio_file_path> [model_name/api]")
-        print("Example (Local): python transcribe.py my_audio.mp3 small")
-        print("Example (API):   python transcribe.py my_audio.mp3 api")
+        print("Usage: python transcribe.py <audio_file_path> [model_name/api] [prompt]")
+        print("Example (Local): python transcribe.py my_audio.mp3 small \"интервью про IT\"")
+        print("Example (API):   python transcribe.py my_audio.mp3 api \"важны имена и термины\"")
     else:
         file_path = sys.argv[1]
         arg2 = sys.argv[2] if len(sys.argv) > 2 else "base"
+        prompt = sys.argv[3] if len(sys.argv) > 3 else ""
         
         if arg2.lower() == "api":
-            transcribe_audio(file_path, use_api=True)
+            transcribe_audio(file_path, use_api=True, prompt=prompt)
         else:
-            transcribe_audio(file_path, model_name=arg2)
+            transcribe_audio(file_path, model_name=arg2, prompt=prompt)

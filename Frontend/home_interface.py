@@ -1,4 +1,4 @@
-from PyQt6.QtCore import Qt, QThread
+from PyQt6.QtCore import Qt, QThread, QTimer
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout
 from qfluentwidgets import (SwitchButton, SubtitleLabel, BodyLabel, 
                             TextEdit, CardWidget, IconWidget, ComboBox)
@@ -6,7 +6,7 @@ from qfluentwidgets import FluentIcon as FIF
 import os
 import sys
 from workers import GlobalSpeechWorker
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key
 
 def get_env_path():
     """Возвращает путь к .env файлу (AppData для exe, корень проекта для скрипта)"""
@@ -16,19 +16,27 @@ def get_env_path():
     else:
         return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
 
+def get_dictionary_path():
+    """Возвращает путь к файлу словаря."""
+    if getattr(sys, 'frozen', False):
+        appdata_dir = os.path.join(os.environ.get('APPDATA', ''), 'WisperAI')
+        os.makedirs(appdata_dir, exist_ok=True)
+        return os.path.join(appdata_dir, "dictionary.json")
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dictionary.json")
+
 class HomeInterface(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent=parent)
         self.setObjectName("HomeInterface")
+        self.env_path = get_env_path()
         
         # Explicitly reload .env to ensure fresh settings
-        env_path = get_env_path()
-        load_dotenv(env_path, override=True)
+        load_dotenv(self.env_path, override=True)
         
         # Debug prints
         mode = os.getenv("DEFAULT_MODE")
         key = os.getenv("GROQ_API_KEY")
-        print(f"DEBUG: Loaded .env from {env_path}")
+        print(f"DEBUG: Loaded .env from {self.env_path}")
         print(f"DEBUG: DEFAULT_MODE='{mode}'")
         print(f"DEBUG: GROQ_API_KEY found? {bool(key)}")
         
@@ -36,6 +44,10 @@ class HomeInterface(QWidget):
         self.thread = None
         self.mode_text = "Whisper"
         self.current_hotkey = "F8"
+        self.dictionary_path = get_dictionary_path()
+        self.prompt_save_timer = QTimer(self)
+        self.prompt_save_timer.setSingleShot(True)
+        self.prompt_save_timer.timeout.connect(self.save_prompt_to_env)
         
         self.initUI()
         self.initWorker()
@@ -102,6 +114,16 @@ class HomeInterface(QWidget):
         
         self.vBoxLayout.addWidget(self.controlCard)
 
+        # Prompt Area
+        self.promptLabel = BodyLabel("Промт диктовки (сохраняется автоматически):", self)
+        self.vBoxLayout.addWidget(self.promptLabel)
+        self.promptText = TextEdit(self)
+        self.promptText.setPlaceholderText("Например: распознавай технические термины и имена собственные максимально точно")
+        self.promptText.setFixedHeight(90)
+        self.promptText.setText(os.getenv("DICTATION_PROMPT", ""))
+        self.promptText.textChanged.connect(self.on_prompt_text_changed)
+        self.vBoxLayout.addWidget(self.promptText)
+
         # Log Area
         self.logLabel = BodyLabel("Журнал событий:", self)
         self.vBoxLayout.addWidget(self.logLabel)
@@ -116,6 +138,7 @@ class HomeInterface(QWidget):
         yandex_key = os.getenv("YANDEX_API_KEY")
         folder_id = os.getenv("YANDEX_FOLDER_ID")
         hotkey = os.getenv("HOTKEY", "F8")
+        prompt_text = os.getenv("DICTATION_PROMPT", "").strip()
         
         # Сохраняем для отображения в статусе
         self.current_hotkey = hotkey
@@ -133,7 +156,9 @@ class HomeInterface(QWidget):
             use_groq=use_groq, 
             use_yandex=use_yandex,
             model_name=model_size,
-            hotkey=hotkey
+            hotkey=hotkey,
+            prompt_text=prompt_text,
+            dictionary_path=self.dictionary_path
         )
         self.thread = QThread()
         self.worker.moveToThread(self.thread)
@@ -163,6 +188,9 @@ class HomeInterface(QWidget):
             self.worker.yandex_folder_id = os.getenv("YANDEX_FOLDER_ID")
             self.worker.model_name = os.getenv("MODEL_SIZE", "small")
             self.worker.hotkey = self.current_hotkey
+            self.worker.prompt_text = self.promptText.toPlainText().strip()
+            self.worker.dictionary_path = self.dictionary_path
+            self.save_prompt_to_env()
             
             self.modeComboBox.setEnabled(False)
             
@@ -254,3 +282,18 @@ class HomeInterface(QWidget):
         if not self.switchButton.isChecked():
             self.modeComboBox.setEnabled(True)
         self.switchButton.setEnabled(True)
+
+    def on_prompt_text_changed(self):
+        self.prompt_save_timer.start(700)
+
+    def save_prompt_to_env(self):
+        prompt_value = self.promptText.toPlainText().strip()
+        try:
+            os.makedirs(os.path.dirname(self.env_path), exist_ok=True)
+            if not os.path.exists(self.env_path):
+                with open(self.env_path, "w", encoding="utf-8") as env_file:
+                    env_file.write("")
+            set_key(self.env_path, "DICTATION_PROMPT", prompt_value)
+            os.environ["DICTATION_PROMPT"] = prompt_value
+        except Exception as e:
+            self.log_message(f"⚠️ Не удалось сохранить промт: {e}")

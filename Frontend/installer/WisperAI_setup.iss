@@ -2,7 +2,7 @@
 ; Скачать Inno Setup: https://jrsoftware.org/isinfo.php
 
 #define MyAppName "Wisper AI"
-#define MyAppVersion "1.0"
+#define MyAppVersion "1.2.0"
 #define MyAppPublisher "Wisper"
 #define MyAppURL "https://github.com/wisper"
 #define MyAppExeName "WisperAI.exe"

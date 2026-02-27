@@ -3,18 +3,29 @@ import os
 import tempfile
 import threading
 import wave
+import base64
+import math
+import shutil
 import keyboard
 import pyaudio
 import pyperclip
 import gc
 import hashlib
+import json
+import re
 import requests
 import subprocess
 import sys
+import traceback
 import urllib.request
 import warnings
 from groq import Groq
 from PyQt6.QtCore import QObject, pyqtSignal, QThread
+
+try:
+    import pymorphy3
+except ImportError:
+    pymorphy3 = None
 
 # Патч для скрытия консольного окна ffmpeg на Windows
 if sys.platform == "win32":
@@ -38,7 +49,8 @@ class GlobalSpeechWorker(QObject):
     event_message = pyqtSignal(str)
     
     def __init__(self, api_key=None, model_name="small", hotkey="F8", 
-                 use_groq=False, use_yandex=False, yandex_key=None, yandex_folder_id=None):
+                 use_groq=False, use_yandex=False, yandex_key=None, yandex_folder_id=None,
+                 prompt_text="", dictionary_path=None):
         super().__init__()
         self.api_key = api_key
         self.yandex_key = yandex_key
@@ -54,6 +66,188 @@ class GlobalSpeechWorker(QObject):
         self.initialized = False
         self._last_download_percent = -1
         self._last_logged_bucket = -1
+        self.prompt_text = prompt_text.strip() if prompt_text else ""
+        self.dictionary_path = dictionary_path or self.get_default_dictionary_path()
+        self._morph_analyzer = None
+        self._morph_checked = False
+        self._morph_warning_shown = False
+
+    @staticmethod
+    def get_default_dictionary_path():
+        """Возвращает путь к файлу словаря."""
+        if getattr(sys, 'frozen', False):
+            appdata_dir = os.path.join(os.environ.get('APPDATA', ''), 'WisperAI')
+            os.makedirs(appdata_dir, exist_ok=True)
+            return os.path.join(appdata_dir, "dictionary.json")
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(project_root, "dictionary.json")
+
+    def load_user_dictionary(self):
+        """Загружает правила словаря из файла."""
+        if not self.dictionary_path or not os.path.exists(self.dictionary_path):
+            return []
+        try:
+            with open(self.dictionary_path, "r", encoding="utf-8") as dict_file:
+                payload = json.load(dict_file)
+            if isinstance(payload, list):
+                return payload
+            if isinstance(payload, dict):
+                entries = payload.get("entries", [])
+                return entries if isinstance(entries, list) else []
+        except Exception as e:
+            self.event_message.emit(f"Не удалось загрузить словарь: {e}")
+        return []
+
+    def get_morph_analyzer(self):
+        """Лениво инициализирует морфологический анализатор."""
+        if self._morph_checked:
+            return self._morph_analyzer
+
+        self._morph_checked = True
+        if pymorphy3 is None:
+            return None
+
+        try:
+            self._morph_analyzer = pymorphy3.MorphAnalyzer()
+        except Exception as e:
+            if not self._morph_warning_shown:
+                self._morph_warning_shown = True
+                self.event_message.emit(f"Не удалось запустить pymorphy3: {e}")
+            self._morph_analyzer = None
+        return self._morph_analyzer
+
+    @staticmethod
+    def extract_words(phrase):
+        """Извлекает только словесные токены."""
+        return re.findall(r"[A-Za-zА-Яа-яЁё0-9\-]+", phrase)
+
+    @staticmethod
+    def parse_text_words(text):
+        """Возвращает список слов с их позициями в строке."""
+        words = []
+        for match in re.finditer(r"[A-Za-zА-Яа-яЁё0-9\-]+", text):
+            words.append({
+                "token": match.group(0),
+                "start": match.start(),
+                "end": match.end()
+            })
+        return words
+
+    @staticmethod
+    def lemma_token(token, morph):
+        """Возвращает лемму токена."""
+        if not token:
+            return ""
+        if morph is None:
+            return token.lower()
+        parsed = morph.parse(token)
+        if not parsed:
+            return token.lower()
+        return parsed[0].normal_form
+
+    def apply_dictionary_exact(self, text, entries):
+        """Прямые замены без лемматизации."""
+        normalized_text = text
+        sorted_entries = sorted(
+            entries,
+            key=lambda item: len(str(item.get("source", ""))),
+            reverse=True
+        )
+        for item in sorted_entries:
+            source = str(item.get("source", "")).strip()
+            target = str(item.get("target", "")).strip()
+            if not source:
+                continue
+
+            escaped_source = re.escape(source)
+            if any(char.isspace() for char in source):
+                pattern = escaped_source
+            else:
+                pattern = rf"\b{escaped_source}\b"
+            normalized_text = re.sub(
+                pattern,
+                lambda _match: target,
+                normalized_text,
+                flags=re.IGNORECASE
+            )
+        return normalized_text
+
+    def apply_dictionary_lemma(self, text, entries):
+        """Замены по леммам, чтобы покрывать окончания слов."""
+        morph = self.get_morph_analyzer()
+        if morph is None:
+            if not self._morph_warning_shown:
+                self._morph_warning_shown = True
+                self.event_message.emit(
+                    "pymorphy3 не установлен. Применяются только точные замены словаря."
+                )
+            return text
+
+        lemma_entries = []
+        for item in entries:
+            source = str(item.get("source", "")).strip()
+            target = str(item.get("target", "")).strip()
+            source_words = self.extract_words(source)
+            if not source_words:
+                continue
+            source_lemmas = [self.lemma_token(word, morph) for word in source_words]
+            lemma_entries.append({
+                "lemmas": source_lemmas,
+                "target": target
+            })
+
+        if not lemma_entries:
+            return text
+
+        lemma_entries.sort(key=lambda item: len(item["lemmas"]), reverse=True)
+        text_words = self.parse_text_words(text)
+        if not text_words:
+            return text
+
+        text_lemmas = [self.lemma_token(item["token"], morph) for item in text_words]
+
+        cursor = 0
+        output_parts = []
+        i = 0
+        while i < len(text_words):
+            matched_entry = None
+            matched_len = 0
+            for entry in lemma_entries:
+                entry_lemmas = entry["lemmas"]
+                entry_len = len(entry_lemmas)
+                if i + entry_len > len(text_lemmas):
+                    continue
+                if text_lemmas[i:i + entry_len] == entry_lemmas:
+                    matched_entry = entry
+                    matched_len = entry_len
+                    break
+
+            if matched_entry is None:
+                i += 1
+                continue
+
+            start_pos = text_words[i]["start"]
+            end_pos = text_words[i + matched_len - 1]["end"]
+            output_parts.append(text[cursor:start_pos])
+            output_parts.append(matched_entry["target"])
+            cursor = end_pos
+            i += matched_len
+
+        output_parts.append(text[cursor:])
+        return "".join(output_parts)
+
+    def apply_user_dictionary(self, text):
+        """Применяет пользовательский словарь к распознанному тексту."""
+        if not text:
+            return text
+
+        entries = self.load_user_dictionary()
+        if not entries:
+            return text
+
+        normalized_text = self.apply_dictionary_lemma(text, entries)
+        normalized_text = self.apply_dictionary_exact(normalized_text, entries)
+        return normalized_text
         
     def initialize(self):
         """Loads the model or API client. Runs in the background thread."""
@@ -278,13 +472,16 @@ class GlobalSpeechWorker(QObject):
         try:
             if self.use_groq and self.groq_client:
                 with open(filename, "rb") as file:
-                    transcription = self.groq_client.audio.transcriptions.create(
-                        file=(filename, file.read()),
-                        model="whisper-large-v3",
-                        temperature=0,
-                        language="ru",
-                        response_format="verbose_json",
-                    )
+                    request_data = {
+                        "file": (filename, file.read()),
+                        "model": "whisper-large-v3",
+                        "temperature": 0,
+                        "language": "ru",
+                        "response_format": "verbose_json",
+                    }
+                    if self.prompt_text:
+                        request_data["prompt"] = self.prompt_text
+                    transcription = self.groq_client.audio.transcriptions.create(**request_data)
                     text = transcription.text.strip()
             
             elif self.use_yandex and self.yandex_key:
@@ -323,11 +520,20 @@ class GlobalSpeechWorker(QObject):
                         text = self.yandex_gpt_correct(text)
 
             elif self.model:
-                result = self.model.transcribe(filename, language="ru", fp16=False, initial_prompt="Привет, это проба пера. Пишем текст на русском языке.")
+                initial_prompt = self.prompt_text or "Привет, это проба пера. Пишем текст на русском языке."
+                result = self.model.transcribe(
+                    filename,
+                    language="ru",
+                    fp16=False,
+                    initial_prompt=initial_prompt
+                )
                 text = result["text"].strip()
         except Exception as e:
             self.error_occurred.emit(f"Transcription Error: {e}")
         
+        if text:
+            text = self.apply_user_dictionary(text)
+
         # Cleanup
         gc.collect()
         return text
@@ -351,6 +557,11 @@ class GlobalSpeechWorker(QObject):
                 "на орфографию, выдать текст в правильном русском литературном формате. "
                 "Если это числовые или размерные параметры, то мы пишем числа 1, 2, 3 и т.п."
             )
+            if self.prompt_text:
+                prompt_instruction += (
+                    "\nДополнительный пользовательский контекст для диктовки:\n"
+                    f"{self.prompt_text}"
+                )
             
             data = {
                 "modelUri": f"gpt://{self.yandex_folder_id}/yandexgpt-lite/latest",
@@ -402,100 +613,596 @@ class GlobalSpeechWorker(QObject):
 
 class TranscribeWorker(QObject):
     progress = pyqtSignal(int)
-    finished = pyqtSignal(str) # returns text
+    status = pyqtSignal(str)
+    finished = pyqtSignal(str) # Возвращает текст
     error = pyqtSignal(str)
     
-    def __init__(self, file_path, api_key=None, use_groq=False, model_name="small", 
-                 use_yandex=False, yandex_key=None, yandex_folder_id=None):
+    def __init__(self, file_path, yandex_key=None, yandex_folder_id=None, prompt=""):
         super().__init__()
         self.file_path = file_path
-        self.api_key = api_key
-        self.use_groq = use_groq
-        self.model_name = model_name
-        self.use_yandex = use_yandex
         self.yandex_key = yandex_key
         self.yandex_folder_id = yandex_folder_id
+        self.prompt = prompt.strip() if prompt else ""
+
+    @staticmethod
+    def pretty_api_error(response):
+        """Возвращает структурированную ошибку Yandex API."""
+        try:
+            data = response.json()
+        except Exception:
+            return response.text
+
+        if "error" in data and isinstance(data["error"], dict):
+            err = data["error"]
+            code = err.get("code", "unknown")
+            msg = err.get("message", "no message")
+            details = err.get("details", [])
+            return f"API Error [{code}]: {msg}\nDetails: {json.dumps(details, ensure_ascii=False, indent=2)}"
+        if "error_code" in data or "error_message" in data:
+            code = data.get("error_code", "unknown")
+            msg = data.get("error_message", "no message")
+            return f"API Error [{code}]: {msg}\nRaw: {json.dumps(data, ensure_ascii=False, indent=2)}"
+        return json.dumps(data, ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def build_exception_details(exc):
+        """Формирует полную ошибку с traceback для отображения в UI."""
+        return (
+            f"{type(exc).__name__}: {exc}\n\n"
+            f"Traceback:\n{traceback.format_exc()}"
+        )
+
+    @staticmethod
+    def detect_container_audio_type(file_path):
+        """Определяет тип аудиоконтейнера для Yandex STT v3."""
+        ext = os.path.splitext(file_path.lower())[1]
+        mapping = {
+            ".mp3": "MP3",
+            ".wav": "WAV",
+            ".ogg": "OGG_OPUS",
+            ".opus": "OGG_OPUS"
+        }
+        return mapping.get(ext, "")
+
+    @staticmethod
+    def extract_transcription_text(raw_payload):
+        """Извлекает текст из alternatives ответа getRecognition (JSON/NDJSON)."""
+        candidates = []
+        seen = set()
+
+        def add_candidate(value):
+            if not isinstance(value, str):
+                return
+            text_value = " ".join(value.split()).strip()
+            if not text_value:
+                return
+            if text_value in seen:
+                return
+            seen.add(text_value)
+            candidates.append(text_value)
+
+        def walk_for_alternatives(node):
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if key == "alternatives" and isinstance(value, list):
+                        for alt in value:
+                            if isinstance(alt, dict):
+                                add_candidate(alt.get("text", ""))
+                    else:
+                        walk_for_alternatives(value)
+            elif isinstance(node, list):
+                for item in node:
+                    walk_for_alternatives(item)
+
+        parsed_any = False
+        try:
+            parsed = json.loads(raw_payload)
+            parsed_any = True
+            walk_for_alternatives(parsed)
+        except Exception:
+            pass
+
+        if not parsed_any:
+            for line in raw_payload.splitlines():
+                stripped = line.strip().strip(",")
+                if not stripped:
+                    continue
+                try:
+                    parsed_line = json.loads(stripped)
+                    walk_for_alternatives(parsed_line)
+                    parsed_any = True
+                except Exception:
+                    continue
+
+        if not candidates:
+            return raw_payload.strip()
+
+        # Убираем однословные токены и промежуточные дубли длинных фрагментов.
+        filtered = []
+        filtered_norm = []
+        for text_value in candidates:
+            if len(text_value.split()) < 3:
+                continue
+            norm_value = text_value.lower()
+            replaced = False
+            for i, existing_norm in enumerate(filtered_norm):
+                if norm_value in existing_norm:
+                    replaced = True
+                    break
+                if existing_norm in norm_value:
+                    filtered[i] = text_value
+                    filtered_norm[i] = norm_value
+                    replaced = True
+                    break
+            if not replaced:
+                filtered.append(text_value)
+                filtered_norm.append(norm_value)
+
+        if filtered:
+            return "\n\n".join(filtered).strip()
+        return "\n\n".join(candidates).strip()
+
+    def yandex_gpt_correct(self, text):
+        """Постобработка текста через YandexGPT (опционально)."""
+        if not text or not self.yandex_folder_id:
+            return text
+
+        try:
+            gpt_url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+            gpt_headers = {
+                "Authorization": f"Api-key {self.yandex_key}",
+                "x-folder-id": self.yandex_folder_id,
+                "Content-Type": "application/json"
+            }
+            prompt_instruction = (
+                "Входной текст нужно исправить по грамматике, пунктуации и орфографии. "
+                "Верни корректный русский литературный текст."
+            )
+            if self.prompt:
+                prompt_instruction += (
+                    "\nДополнительный пользовательский контекст для расшифровки:\n"
+                    f"{self.prompt}"
+                )
+            gpt_data = {
+                "modelUri": f"gpt://{self.yandex_folder_id}/yandexgpt-lite/latest",
+                "completionOptions": {"stream": False, "temperature": 0.3, "maxTokens": 2000},
+                "messages": [
+                    {"role": "system", "text": prompt_instruction},
+                    {"role": "user", "text": text}
+                ]
+            }
+            gpt_response = requests.post(
+                gpt_url,
+                headers=gpt_headers,
+                json=gpt_data,
+                verify=False,
+                timeout=120
+            )
+            if gpt_response.status_code != 200:
+                print("YandexGPT File Correction Error:")
+                print(self.pretty_api_error(gpt_response))
+                return text
+
+            alternatives = gpt_response.json().get("result", {}).get("alternatives", [])
+            if not alternatives:
+                return text
+            corrected = alternatives[0].get("message", {}).get("text", "").strip()
+            return corrected if corrected else text
+        except Exception:
+            print("YandexGPT File Correction Exception:")
+            traceback.print_exc()
+            return text
 
     def run(self):
         try:
+            self.status.emit("Проверка файла...")
             if not os.path.exists(self.file_path):
-                self.error.emit("File not found")
+                self.error.emit(f"Файл не найден: {self.file_path}")
+                return
+            if not self.yandex_key:
+                self.error.emit("Не задан YANDEX_API_KEY.")
+                return
+            if not self.yandex_folder_id:
+                self.error.emit("Не задан YANDEX_FOLDER_ID.")
                 return
 
-            text = ""
-            if self.use_groq and self.api_key:
-                client = Groq(api_key=self.api_key)
-                with open(self.file_path, "rb") as file:
-                    transcription = client.audio.transcriptions.create(
-                        file=(self.file_path, file.read()),
-                        model="whisper-large-v3",
-                        temperature=0,
-                        language="ru",
-                        response_format="verbose_json",
+            container_type = self.detect_container_audio_type(self.file_path)
+            if not container_type:
+                self.error.emit(
+                    "Неподдерживаемый формат файла. Используйте mp3, wav, ogg или opus."
+                )
+                return
+
+            self.status.emit("Чтение аудиофайла...")
+            with open(self.file_path, "rb") as audio_file:
+                audio_bytes = audio_file.read()
+
+            self.status.emit("Подготовка асинхронного запроса Yandex SpeechKit...")
+            request_data = {
+                "content": base64.b64encode(audio_bytes).decode("utf-8"),
+                "recognitionModel": {
+                    "model": "general",
+                    "audioFormat": {
+                        "containerAudio": {
+                            "containerAudioType": container_type
+                        }
+                    },
+                    "languageRestriction": {
+                        "restrictionType": "WHITELIST",
+                        "languageCode": ["ru-RU"]
+                    },
+                    "textNormalization": {
+                        "textNormalization": "TEXT_NORMALIZATION_ENABLED",
+                        "phoneFormattingMode": "PHONE_FORMATTING_MODE_DISABLED",
+                        "profanityFilter": True,
+                        "literatureText": True
+                    }
+                },
+                "speakerLabeling": {
+                    "speakerLabeling": "SPEAKER_LABELING_DISABLED"
+                }
+            }
+
+            headers = {
+                "Authorization": f"Api-key {self.yandex_key}",
+                "x-folder-id": self.yandex_folder_id
+            }
+
+            create_url = "https://stt.api.cloud.yandex.net/stt/v3/recognizeFileAsync"
+            create_response = requests.post(
+                create_url,
+                headers=headers,
+                json=request_data,
+                verify=False,
+                timeout=120
+            )
+            if create_response.status_code != 200:
+                api_error = self.pretty_api_error(create_response)
+                print("Yandex SpeechKit Error:")
+                print(api_error)
+                self.error.emit(f"Yandex Error: {create_response.status_code}\n{api_error}")
+                return
+
+            operation_id = create_response.json().get("id")
+            if not operation_id:
+                self.error.emit("Yandex SpeechKit не вернул operation id.")
+                return
+
+            self.status.emit(f"Операция создана: {operation_id}. Ожидание завершения...")
+            operation_url = f"https://operation.api.cloud.yandex.net/operations/{operation_id}"
+
+            while True:
+                operation_response = requests.get(
+                    operation_url,
+                    headers=headers,
+                    verify=False,
+                    timeout=120
+                )
+                if operation_response.status_code != 200:
+                    api_error = self.pretty_api_error(operation_response)
+                    raise RuntimeError(
+                        f"Ошибка проверки операции: {operation_response.status_code}\n{api_error}"
                     )
-                    text = transcription.text
-            elif self.use_yandex and self.yandex_key:
-                with open(self.file_path, "rb") as f:
-                    data = f.read()
-                
-                params = {"lang": "ru-RU", "topic": "general"}
-                if self.yandex_folder_id: params["folderId"] = self.yandex_folder_id
-                
-                headers = {"Authorization": f"Api-Key {self.yandex_key}"}
-                url = "https://stt.api.cloud.yandex.net/speech/v1/stt:recognize"
-                
-                if self.file_path.endswith(".wav"):
-                    params["format"] = "lpcm"
-                    params["sampleRateHertz"] = 48000
-                    data = data[44:]
 
-                response = requests.post(url, headers=headers, params=params, data=data)
-                if response.status_code == 200:
-                    text = response.json().get("result", "")
-                    
-                    # --- YandexGPT Post-Processing ---
-                    if text and self.yandex_folder_id:
-                        try:
-                            # We reuse the logic. ideally this should be a shared function, 
-                            # but for now we inline it to match the GlobalSpeechWorker behavior.
-                            gpt_url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
-                            gpt_headers = {
-                                "Authorization": f"Api-Key {self.yandex_key}",
-                                "x-folder-id": self.yandex_folder_id,
-                                "Content-Type": "application/json"
-                            }
-                            prompt_instruction = (
-                                "Входной текст, который тебе подается, нужно проверить на грамматику, пунктуацию, "
-                                "на орфографию, выдать текст в правильном русском литературном формате. "
-                                "Если это числовые или размерные параметры, то мы пишем числа 1, 2, 3 и т.п."
-                            )
-                            gpt_data = {
-                                "modelUri": f"gpt://{self.yandex_folder_id}/yandexgpt-lite/latest",
-                                "completionOptions": {"stream": False, "temperature": 0.3, "maxTokens": 2000},
-                                "messages": [
-                                    {"role": "system", "text": prompt_instruction},
-                                    {"role": "user", "text": text}
-                                ]
-                            }
-                            gpt_response = requests.post(gpt_url, headers=gpt_headers, json=gpt_data)
-                            if gpt_response.status_code == 200:
-                                alts = gpt_response.json().get("result", {}).get("alternatives", [])
-                                if alts:
-                                    corrected = alts[0].get("message", {}).get("text", "")
-                                    if corrected:
-                                        text = corrected.strip()
-                        except Exception as val_err:
-                            print(f"YandexGPT File Correction Error: {val_err}")
+                operation_data = operation_response.json()
+                if operation_data.get("done"):
+                    if "error" in operation_data:
+                        raise RuntimeError(
+                            "Операция завершилась с ошибкой:\n"
+                            f"{json.dumps(operation_data['error'], ensure_ascii=False, indent=2)}"
+                        )
+                    break
 
-                else:
-                    self.error.emit(f"Yandex Error: {response.text}")
-                    return
-            else:
-                model = whisper.load_model(self.model_name)
-                result = model.transcribe(self.file_path, fp16=False, language="ru")
-                text = result["text"]
-            
+                self.status.emit("Yandex SpeechKit обрабатывает файл, ожидаем результат...")
+                time.sleep(3)
+
+            self.status.emit("Получение результата распознавания...")
+            result_response = requests.get(
+                "https://stt.api.cloud.yandex.net/stt/v3/getRecognition",
+                headers=headers,
+                params={"operationId": operation_id},
+                verify=False,
+                timeout=120
+            )
+            if result_response.status_code != 200:
+                api_error = self.pretty_api_error(result_response)
+                raise RuntimeError(
+                    f"Ошибка получения результата: {result_response.status_code}\n{api_error}"
+                )
+
+            text = self.extract_transcription_text(result_response.text)
+            if self.prompt and text:
+                self.status.emit("Постобработка текста через YandexGPT...")
+                text = self.yandex_gpt_correct(text)
+
+            self.status.emit("Распознавание через Yandex SpeechKit завершено.")
             self.finished.emit(text)
             
         except Exception as e:
-            self.error.emit(str(e))
+            print("TranscribeWorker Exception:")
+            traceback.print_exc()
+            self.error.emit(self.build_exception_details(e))
+
+
+class ChunkedTranscribeWorker(TranscribeWorker):
+    def __init__(
+        self,
+        file_path,
+        yandex_key=None,
+        yandex_folder_id=None,
+        prompt="",
+        max_part_mb=25,
+        target_part_mb=24,
+        mp3_bitrate_kbps=96
+    ):
+        super().__init__(
+            file_path=file_path,
+            yandex_key=yandex_key,
+            yandex_folder_id=yandex_folder_id,
+            prompt=prompt
+        )
+        self.max_part_bytes = max_part_mb * 1024 * 1024
+        self.target_part_bytes = target_part_mb * 1024 * 1024
+        self.mp3_bitrate_kbps = mp3_bitrate_kbps
+
+    @staticmethod
+    def get_audio_duration_seconds(ffprobe_bin, file_path):
+        """Возвращает длительность аудио в секундах через ffprobe."""
+        command = [
+            ffprobe_bin,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            file_path
+        ]
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(
+                "Не удалось определить длительность файла через ffprobe:\n"
+                f"{result.stderr.strip()}"
+            )
+        try:
+            return float(result.stdout.strip())
+        except ValueError as exc:
+            raise RuntimeError("ffprobe вернул некорректную длительность файла.") from exc
+
+    @staticmethod
+    def convert_part_to_mp3(ffmpeg_bin, input_path, output_path, start_sec, duration_sec, bitrate_kbps):
+        """Конвертирует часть исходного файла в mp3 с заданным битрейтом."""
+        command = [
+            ffmpeg_bin,
+            "-y",
+            "-ss",
+            f"{start_sec:.3f}",
+            "-t",
+            f"{duration_sec:.3f}",
+            "-i",
+            input_path,
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-b:a",
+            f"{bitrate_kbps}k",
+            output_path
+        ]
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(
+                "Ошибка ffmpeg при конвертации части файла:\n"
+                f"{result.stderr.strip()}"
+            )
+
+    def transcribe_part(self, part_path, part_number, total_parts):
+        """Отправляет одну mp3-часть в Yandex SpeechKit Async v3."""
+        with open(part_path, "rb") as part_file:
+            part_bytes = part_file.read()
+
+        headers = {
+            "Authorization": f"Api-key {self.yandex_key}",
+            "x-folder-id": self.yandex_folder_id
+        }
+        request_data = {
+            "content": base64.b64encode(part_bytes).decode("utf-8"),
+            "recognitionModel": {
+                "model": "general",
+                "audioFormat": {
+                    "containerAudio": {
+                        "containerAudioType": "MP3"
+                    }
+                },
+                "languageRestriction": {
+                    "restrictionType": "WHITELIST",
+                    "languageCode": ["ru-RU"]
+                },
+                "textNormalization": {
+                    "textNormalization": "TEXT_NORMALIZATION_ENABLED",
+                    "phoneFormattingMode": "PHONE_FORMATTING_MODE_DISABLED",
+                    "profanityFilter": True,
+                    "literatureText": True
+                }
+            },
+            "speakerLabeling": {
+                "speakerLabeling": "SPEAKER_LABELING_DISABLED"
+            }
+        }
+
+        self.status.emit(f"Отправка части {part_number}/{total_parts} в Yandex SpeechKit...")
+        create_response = requests.post(
+            "https://stt.api.cloud.yandex.net/stt/v3/recognizeFileAsync",
+            headers=headers,
+            json=request_data,
+            verify=False,
+            timeout=120
+        )
+        if create_response.status_code != 200:
+            api_error = self.pretty_api_error(create_response)
+            raise RuntimeError(
+                f"Yandex Error: {create_response.status_code}\n"
+                f"Часть: {part_number}/{total_parts}\n{api_error}"
+            )
+
+        operation_id = create_response.json().get("id")
+        if not operation_id:
+            raise RuntimeError(f"Yandex не вернул operation id для части {part_number}/{total_parts}.")
+
+        operation_url = f"https://operation.api.cloud.yandex.net/operations/{operation_id}"
+        while True:
+            operation_response = requests.get(
+                operation_url,
+                headers=headers,
+                verify=False,
+                timeout=120
+            )
+            if operation_response.status_code != 200:
+                api_error = self.pretty_api_error(operation_response)
+                raise RuntimeError(
+                    f"Ошибка проверки операции для части {part_number}/{total_parts}: "
+                    f"{operation_response.status_code}\n{api_error}"
+                )
+
+            operation_data = operation_response.json()
+            if operation_data.get("done"):
+                if "error" in operation_data:
+                    raise RuntimeError(
+                        f"Операция завершилась с ошибкой для части {part_number}/{total_parts}:\n"
+                        f"{json.dumps(operation_data['error'], ensure_ascii=False, indent=2)}"
+                    )
+                break
+
+            self.status.emit(
+                f"Yandex обрабатывает часть {part_number}/{total_parts}, ожидаем результат..."
+            )
+            time.sleep(2)
+
+        result_response = requests.get(
+            "https://stt.api.cloud.yandex.net/stt/v3/getRecognition",
+            headers=headers,
+            params={"operationId": operation_id},
+            verify=False,
+            timeout=120
+        )
+        if result_response.status_code != 200:
+            api_error = self.pretty_api_error(result_response)
+            raise RuntimeError(
+                f"Ошибка получения результата для части {part_number}/{total_parts}: "
+                f"{result_response.status_code}\n{api_error}"
+            )
+
+        text = self.extract_transcription_text(result_response.text).strip()
+        if self.prompt and text:
+            self.status.emit(f"Постобработка части {part_number}/{total_parts} через YandexGPT...")
+            text = self.yandex_gpt_correct(text)
+        return text
+
+    def run(self):
+        try:
+            self.status.emit("Проверка параметров обработки...")
+            if not os.path.exists(self.file_path):
+                self.error.emit(f"Файл не найден: {self.file_path}")
+                return
+            if not self.yandex_key:
+                self.error.emit("Не задан YANDEX_API_KEY.")
+                return
+            if not self.yandex_folder_id:
+                self.error.emit("Не задан YANDEX_FOLDER_ID.")
+                return
+
+            ffmpeg_bin = shutil.which("ffmpeg")
+            ffprobe_bin = shutil.which("ffprobe")
+            if not ffmpeg_bin or not ffprobe_bin:
+                self.error.emit(
+                    "Не найдены ffmpeg/ffprobe. Установите ffmpeg и добавьте его в PATH."
+                )
+                return
+
+            duration_seconds = self.get_audio_duration_seconds(ffprobe_bin, self.file_path)
+            if duration_seconds <= 0:
+                self.error.emit("Не удалось определить длительность аудиофайла.")
+                return
+
+            part_duration_seconds = max(
+                60,
+                int((self.target_part_bytes * 8) / (self.mp3_bitrate_kbps * 1000))
+            )
+            total_parts = max(1, math.ceil(duration_seconds / part_duration_seconds))
+
+            self.status.emit(
+                f"Запущена обработка большого файла: частей {total_parts}, цель <= 25MB на часть."
+            )
+
+            transcribed_parts = []
+            with tempfile.TemporaryDirectory(prefix="wisper_chunks_") as temp_dir:
+                for part_index in range(total_parts):
+                    start_sec = part_index * part_duration_seconds
+                    remaining = max(0.0, duration_seconds - start_sec)
+                    if remaining <= 0:
+                        continue
+                    current_duration = min(part_duration_seconds, remaining)
+
+                    part_number = part_index + 1
+                    part_path = os.path.join(temp_dir, f"part_{part_number:03d}.mp3")
+                    self.status.emit(
+                        f"Конвертация части {part_number}/{total_parts} в mp3 "
+                        f"({self.mp3_bitrate_kbps} kbps)..."
+                    )
+                    self.convert_part_to_mp3(
+                        ffmpeg_bin=ffmpeg_bin,
+                        input_path=self.file_path,
+                        output_path=part_path,
+                        start_sec=start_sec,
+                        duration_sec=current_duration,
+                        bitrate_kbps=self.mp3_bitrate_kbps
+                    )
+
+                    part_size = os.path.getsize(part_path)
+                    if part_size > self.max_part_bytes:
+                        reduced = False
+                        for fallback_bitrate in [80, 64, 48, 32]:
+                            if fallback_bitrate >= self.mp3_bitrate_kbps:
+                                continue
+                            self.status.emit(
+                                f"Часть {part_number}/{total_parts} > 25MB, повторная конвертация "
+                                f"с битрейтом {fallback_bitrate} kbps..."
+                            )
+                            self.convert_part_to_mp3(
+                                ffmpeg_bin=ffmpeg_bin,
+                                input_path=self.file_path,
+                                output_path=part_path,
+                                start_sec=start_sec,
+                                duration_sec=current_duration,
+                                bitrate_kbps=fallback_bitrate
+                            )
+                            part_size = os.path.getsize(part_path)
+                            if part_size <= self.max_part_bytes:
+                                reduced = True
+                                break
+                        if not reduced and part_size > self.max_part_bytes:
+                            raise RuntimeError(
+                                f"Не удалось уменьшить часть {part_number}/{total_parts} до 25MB. "
+                                f"Текущий размер: {part_size} байт."
+                            )
+
+                    part_text = self.transcribe_part(
+                        part_path=part_path,
+                        part_number=part_number,
+                        total_parts=total_parts
+                    )
+                    if part_text:
+                        transcribed_parts.append(part_text)
+
+            final_text = "\n\n".join(transcribed_parts).strip()
+            if not final_text:
+                self.error.emit("Распознавание завершено, но текст пустой.")
+                return
+
+            self.status.emit("Склейка частей завершена.")
+            self.finished.emit(final_text)
+        except Exception as exc:
+            print("ChunkedTranscribeWorker Exception:")
+            traceback.print_exc()
+            self.error.emit(self.build_exception_details(exc))

@@ -11,7 +11,15 @@ binaries = [
     (os.path.join(ffmpeg_path, 'ffmpeg.exe'), '.'),
     (os.path.join(ffmpeg_path, 'ffprobe.exe'), '.'),
 ]
-hiddenimports = ['pyaudio', 'keyboard', 'groq', 'requests']
+hiddenimports = [
+    'pyaudio',
+    'keyboard',
+    'groq',
+    'requests',
+    'pymorphy3',
+    'pymorphy3_dicts_ru',
+    'dawg_python',
+]
 
 # Собираем все зависимости qfluentwidgets
 tmp_ret = collect_all('qfluentwidgets')
@@ -19,6 +27,10 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 # Собираем все зависимости whisper
 tmp_ret = collect_all('whisper')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+
+# Собираем все зависимости pymorphy3
+tmp_ret = collect_all('pymorphy3')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 a = Analysis(
